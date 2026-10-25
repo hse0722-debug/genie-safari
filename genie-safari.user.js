@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 지니 Safari 도우미 (수동 다운로드 확인)
 // @namespace genie-safari-local
-// @version 1.0.16
+// @version 1.0.17
 // @updateURL https://hse0722-debug.github.io/genie-safari/genie-safari.user.js
 // @downloadURL https://hse0722-debug.github.io/genie-safari/genie-safari.user.js
 // @match https://*.genie.co.kr/*
@@ -226,6 +226,14 @@ if((genieDownloadPage || (location.hostname === 'pay.genie.co.kr' && !/시크릿
   };
   box.append(status,button);document.documentElement.appendChild(box);
  },50);
+}
+
+
+function genieLoginPageError() {
+ const body=document.body?.cloneNode(true);
+ if(!body)return false;
+ body.querySelectorAll('#genie-helper-dashboard,#genie-open-btn,#genie-startup-error,script,style').forEach(el=>el.remove());
+ return /일치하지 않습니다|다시 확인해주세요/.test(body.innerText || body.textContent || '');
 }
 
 function genieShowError(error) {
@@ -891,6 +899,7 @@ async function processTask() {
         const blocked=/본인 인증을 완료|본인인증이 필요|인증번호를 입력|보안문자를 입력|비밀번호가 일치하지|아이디 또는 비밀번호/.test(document.body?.innerText||'');
         if(!visibleLogin&&!blocked&&(location.origin+location.pathname!==pending.page||isUserLoggedIn())){
           sessionStorage.removeItem('genie-safari-login-pending');
+          sessionStorage.removeItem('genie-login-submitted');
           const next=getNextStageUrl('ALBUM_LIKE',{...data,albumIndex:0});
           await chrome.storage.local.set({step:next.step,albumIndex:0,songIndex:0,waitRetry:0});
           await saveLog('로그인 후 안내 화면을 건너뛰고 등록한 앨범으로 이동합니다.','INFO');
@@ -919,8 +928,12 @@ async function processTask() {
       document.querySelector('input[name="gnb_uxx"]');
 
     if (currentUrl.includes('/member/popLogin') || currentUrl.includes('/member/login') || (idInput && pwInput && idInput.offsetParent !== null)) {
-      if (document.body && (document.body.innerText.includes('일치하지 않습니다') || document.body.innerText.includes('다시 확인해주세요'))) {
-        await saveLog(`❌ ${currentAccount.id} - 로그인 실패(아이디/비번 오류 스킵)`, 'ERROR');
+      const attemptText=sessionStorage.getItem('genie-login-submitted');
+      let submitted;try{submitted=JSON.parse(attemptText||'null');}catch(_){}
+      if (submitted?.account===currentAccount.id && Date.now()-submitted.time>=1500 && genieLoginPageError()) {
+        sessionStorage.removeItem('genie-login-submitted');
+        sessionStorage.removeItem('genie-safari-login-pending');
+        await saveLog(`❌ ${currentAccount.id} - 로그인 응답 오류 확인 후 다음 계정`, 'ERROR');
         await updateStepResult(currentAccount.id, 'album', 'x');
         await updateStepResult(currentAccount.id, 'song', 'x');
         await updateStepResult(currentAccount.id, 'down', 'x');
@@ -937,6 +950,7 @@ async function processTask() {
       }
 
       if (idInput && pwInput) {
+        if(submitted?.account===currentAccount.id && Date.now()-submitted.time<8000){isStepRunning=false;return;}
         setInputValue(idInput, currentAccount.id);
         setInputValue(pwInput, currentAccount.pw);
 
@@ -961,10 +975,9 @@ async function processTask() {
             document.querySelector('input[type="submit"]') ||
             document.querySelector('button[type="submit"]') ||
             document.querySelector('.btn-login');
-          if (loginBtn) {
-            loginBtn.click();
-          }
-          callPageFunction('loginID');
+          sessionStorage.setItem('genie-login-submitted',JSON.stringify({account:currentAccount.id,time:Date.now()}));
+          if (loginBtn) loginBtn.click();
+          else callPageFunction('loginID');
         }, 900);
         isStepRunning = false;
         return;
