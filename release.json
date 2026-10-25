@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "1.0.20",
+  "version": "1.0.21",
   "main": {
-    "file": "genie-main-1.0.20.js",
-    "sha256": "05ecba0c26e4e13603c5f6c0b5e36a3253f492a2e79ea65747e3d87963c516e2"
+    "file": "genie-main-1.0.21.js",
+    "sha256": "883b3c1047c96bbb918bc7b26f9096b7dd1019f72c54fa8cd57e1a00ec757058"
   },
   "bridge": {
-    "file": "genie-bridge-1.0.18.js",
-    "sha256": "622d912aa5cb0ccb7c04bd650d0d7b3c5e45e07e087e546b4acd285c51b4c92c"
+    "file": "genie-bridge-1.0.21.js",
+    "sha256": "79cf8e33170d2032890badc3885a29c0f9735df04d396970dc0db27cb9c7e4aa"
   }
 }

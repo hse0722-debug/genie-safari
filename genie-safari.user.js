@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 지니 Safari 도우미 (수동 다운로드 확인)
 // @namespace genie-safari-local
-// @version 1.0.20
+// @version 1.0.21
 // @updateURL https://hse0722-debug.github.io/genie-safari/genie-safari.user.js
 // @downloadURL https://hse0722-debug.github.io/genie-safari/genie-safari.user.js
 // @match https://*.genie.co.kr/*
@@ -62,33 +62,12 @@ const fetch = (url, options) => String(url).startsWith('https://docs.google.com/
 
 const genieDownloadPage = location.hostname === 'www.genie.co.kr' && /^\/download\//i.test(location.pathname);
 
-// Restore the controller after an explicit post-login promotion redirect.
-(async()=>{ if(location.hostname === 'www.genie.co.kr') {
- const resume=await GM.getValue('safariPromotionResume',null);
- const current=await chrome.storage.local.get(['isRunning','currentIndex']);
- if(resume && current.isRunning && resume.index===current.currentIndex && Date.now()-resume.time<120000) {
-  await GM.deleteValue('safariPromotionResume');
-  await GM.setValue('safariControllerOwner',safariTabToken());
-  sessionStorage.setItem('genie-safari-controller','yes');
- }
-}
-})();
 let promotionHandled=false;
 setInterval(async()=>{
- if(promotionHandled || window!==window.top || location.hostname!=='pay.genie.co.kr') return;
- const later=Array.from(document.querySelectorAll('a,button,input[type="button"]')).find(el=>/나중에\s*보기/.test(el.textContent||el.value||'') && el.getClientRects().length);
- const body=document.body?.innerText||'';
- if(!later || !/시크릿\s*할인|12개월/.test(body))return;
- const state=await chrome.storage.local.get(['isRunning','accounts','currentIndex','albums']);
- if(!state.isRunning || !state.accounts?.[state.currentIndex] || !state.albums?.length)return;
- promotionHandled=true;
- try{
-  await chrome.storage.local.set({step:'ALBUM_LIKE',albumIndex:0,songIndex:0,waitRetry:0});
-  await GM.setValue('safariPromotionResume',{index:state.currentIndex,time:Date.now()});
-  await saveLog('로그인 후 이용권 할인 안내를 건너뛰고 앨범으로 이동합니다.','INFO');
-  later.click();
-  setTimeout(()=>location.replace(getUrl('album',state.albums[0])),800);
- }catch(error){promotionHandled=false;console.error(error);}
+ if(promotionHandled||document.hidden||location.hostname!=='pay.genie.co.kr')return;
+ const later=Array.from(document.querySelectorAll('a,button')).find(el=>/나중에\s*보기/.test(el.textContent||'')&&el.getClientRects().length);
+ if(!later||!/시크릿\s*할인|12개월/.test(document.body?.innerText||''))return;
+ promotionHandled=true;later.click();
 },500);
 
 
@@ -96,11 +75,88 @@ setInterval(async()=>{
 
 
 
-function safariTabToken(){let id=sessionStorage.getItem('genie-safari-tab-id');if(!id){id=Date.now()+':'+Math.random();sessionStorage.setItem('genie-safari-tab-id',id);}return id;}
-async function safariOwnsController(){const owner=await GM.getValue('safariControllerOwner',null);return !owner||owner===safariTabToken();}
+function sessionIdentity(){try{return JSON.parse(document.documentElement.getAttribute('data-genie-session')||'null');}catch(_){return null;}}
+function identityVerdict(snapshot,target,bindings){
+ if(!snapshot?.memberNo)return {status:'unknown',actual:null};
+ const actual=bindings?.[snapshot.memberNo]||null;
+ return {status:actual===target?'match':actual?'mismatch':'unbound',actual};
+}
+async function verifyCurrentAccount(data){
+ const target=data.accounts?.[data.currentIndex]?.id;
+ const snapshot=sessionIdentity();const bindings=await GM.getValue('verifiedMemberBindings',{});
+ const verdict=identityVerdict(snapshot,target,bindings);
+ if(verdict.status==='match'){
+  document.getElementById('genie-account-verification')?.remove();
+  await GM.setValue('verifiedSession',{account:target,index:data.currentIndex,memberNo:snapshot.memberNo});
+  return true;
+ }
+
+ let box=document.getElementById('genie-account-verification');
+ if(!box){box=document.createElement('div');box.id='genie-account-verification';box.style.cssText='position:fixed;top:65px;left:12px;right:12px;z-index:2147483647;background:#fff4d5;padding:16px;border:2px solid #c0392b;color:#111;font-size:16px;';document.documentElement.appendChild(box);}
+ const renderKey=target+':'+(snapshot?.memberNo||'unknown')+':'+verdict.status;
+ if(box.dataset.key===renderKey)return false;box.dataset.key=renderKey;
+ box.replaceChildren();
+ const label=document.createElement('div');label.textContent='작업 보류 · 목표 '+target+' / 실제 '+(verdict.actual||'전체 ID 미확인')+' / 회원번호 '+(snapshot?.memberNo||'미확인 · 페이지 연결 실행기 확인 필요');box.appendChild(label);
+ if(verdict.status==='unbound'){
+  const input=document.createElement('input');input.placeholder='지니에서 확인한 실제 전체 아이디 입력';input.style.cssText='width:95%;padding:10px;';
+  const button=document.createElement('button');button.textContent='실제 계정 확인 후 회원번호 연결';
+  button.onclick=async()=>{
+   const value=input.value.trim();if(value!==target){alert('목표 계정과 다릅니다. 실제 계정으로 다시 로그인해 주세요.');return;}
+   if(!confirm('지니 마이페이지 등에서 실제 로그인 아이디가 '+value+'임을 직접 확인했나요?'))return;
+   const now=sessionIdentity();if(!now?.memberNo||now.memberNo!==snapshot.memberNo){alert('로그인 세션이 바뀌었습니다. 새로고침해 주세요.');return;}
+   const map=await GM.getValue('verifiedMemberBindings',{});map[now.memberNo]=value;await GM.setValue('verifiedMemberBindings',map);box.remove();
+   await saveLog('사용자 확인으로 실제 회원번호와 계정 연결: '+value,'INFO');
+  };box.append(input,button);
+ }
+ return false;
+}
+async function stillCurrent(expected){
+ if(document.hidden||!(await safariOwnsController()))return false;
+ const d=await chrome.storage.local.get(['accounts','currentIndex','isRunning']);
+ const snap=sessionIdentity();const verified=await GM.getValue('verifiedSession',null);
+ return !!(d.isRunning&&d.accounts?.[d.currentIndex]?.id===expected&&verified?.account===expected&&verified.index===d.currentIndex&&snap?.memberNo===verified.memberNo);
+}
+async function requestUserNext(outcome){
+ if(!['started','completed','failed'].includes(outcome))throw new Error('다운로드 결과를 먼저 선택해 주세요.');
+ const d=await chrome.storage.local.get(['accounts','currentIndex','songIndex','step','isRunning']);
+ const target=d.accounts?.[d.currentIndex]?.id;
+ if(!d.isRunning||!['SONG_DOWNLOAD','PAY_POPUP_STEP1','WAIT_DOWNLOAD_STREAM'].includes(d.step))throw new Error('다운로드 대기 상태가 아닙니다.');
+ const verified=await GM.getValue('verifiedSession',null);const snapshot=sessionIdentity();
+ if(!verified||verified.account!==target||verified.index!==d.currentIndex||!snapshot?.memberNo||snapshot.memberNo!==verified.memberNo)throw new Error('실제 로그인 계정이 확인된 작업 계정과 다릅니다. 전환을 중단합니다.');
+ await GM.setValue('safariControllerOwner',safariTabToken());sessionStorage.setItem('genie-navigation-owner',safariTabToken());sessionStorage.setItem('genie-safari-controller','yes');
+ await GM.setValue('safariDownloadApproval',{account:d.currentIndex,accountId:target,memberNo:snapshot.memberNo,song:d.songIndex||0,outcome,due:Date.now()+3000});
+ setTimeout(consumeDownloadApproval,3100);
+}
+async function recordUserDownload(request,data){
+ const account=data.accounts[data.currentIndex].id;
+ const outcomes=await GM.getValue('userDownloadOutcomes',{});
+ const perAccount=outcomes[account]||{};perAccount[data.songs[request.song]]=request.outcome;outcomes[account]=perAccount;
+ await GM.setValue('userDownloadOutcomes',outcomes);
+ const values=data.songs.map(id=>perAccount[id]);
+ const result=values.includes('failed')?'x':values.every(x=>x==='completed')?'o':values.includes(undefined)?'-':'시작확인';
+ await updateStepResult(account,'down',result);
+ await saveLog('사용자 다운로드 결과: '+({started:'시작 확인 (완료 미확인)',completed:'완료 확인',failed:'실패 확인'}[request.outcome])+' · 곡 '+data.songs[request.song],'INFO');
+}
+
+const documentControllerId=Date.now()+':'+Math.random();
+function safariTabToken(){return documentControllerId;}
+
+async function safariOwnsController(){
+ const owner=await GM.getValue('safariControllerOwner',null);
+ if(owner===safariTabToken())return true;
+ if(document.hidden)return false;
+ const previous=sessionStorage.getItem('genie-navigation-owner');
+ if(owner&&owner!==previous)return false;
+ await GM.setValue('safariControllerOwner',safariTabToken());sessionStorage.setItem('genie-navigation-owner',safariTabToken());sessionStorage.setItem('genie-navigation-owner',safariTabToken());return true;
+}
 
 let approvalBusy = false;
-async function consumeDownloadApproval() {
+async function consumeDownloadApproval(){
+ if(document.hidden||window!==window.top)return;
+ if(!navigator.locks)return;
+ return navigator.locks.request('genie-account-worker',{ifAvailable:true},async lock=>{if(lock)await consumeDownloadApprovalUnlocked();});
+}
+async function consumeDownloadApprovalUnlocked() {
  if(!remoteSettingsReady)return;
  if(approvalBusy || window !== window.top || sessionStorage.getItem('genie-safari-controller') !== 'yes') return;
  approvalBusy=true;
@@ -113,7 +169,9 @@ async function consumeDownloadApproval() {
    await GM.deleteValue('safariDownloadApproval'); return;
   }
   await GM.deleteValue('safariDownloadApproval');
-  await saveLog('사용자가 다운로드 승인을 확인했습니다. 3초 대기 후 다음 진행 (파일 완료는 미검증).','INFO');
+  if(request.accountId!==data.accounts?.[data.currentIndex]?.id||!['started','completed','failed'].includes(request.outcome))return;
+  const currentSnapshot=sessionIdentity();if(!currentSnapshot?.memberNo||currentSnapshot.memberNo!==request.memberNo)return;
+  await recordUserDownload(request,data);
   const nextSong=(data.songIndex||0)+1;
   if(nextSong<(data.songs||[]).length){
    await chrome.storage.local.set({songIndex:nextSong,step:'SONG_LIKE',waitRetry:0});
@@ -146,14 +204,15 @@ if((genieDownloadPage || (location.hostname === 'pay.genie.co.kr' && !/시크릿
    try{
     const d=await chrome.storage.local.get(['isRunning','step','currentIndex','songIndex']);
     if(!d.isRunning||!['SONG_DOWNLOAD','PAY_POPUP_STEP1','WAIT_DOWNLOAD_STREAM'].includes(d.step)) {status.textContent='원래 탭이 다운로드 대기 상태가 아닙니다.';button.disabled=false;return;}
-    await GM.setValue('safariControllerOwner',safariTabToken());
-    sessionStorage.setItem('genie-safari-controller','yes');
-    await GM.setValue('safariDownloadApproval',{account:d.currentIndex,song:d.songIndex||0,due:Date.now()+3000});
+    await requestUserNext(resultChoice.value);
     let left=3;status.textContent='3초 후 다음 진행';
     const timer=setInterval(()=>{left--;status.textContent=left>0?left+'초 후 다음 진행':'다음 단계로 이동 중…';if(left<=0){clearInterval(timer);consumeDownloadApproval();try{window.opener?.postMessage('GENIE_APPROVAL_READY','https://www.genie.co.kr');window.opener?.focus();}catch(_){}}},1000);
    }catch(error){status.textContent='오류: '+error.message;button.disabled=false;}
   };
-  box.append(status,button);document.documentElement.appendChild(box);
+  const resultChoice=document.createElement('select');
+  resultChoice.style.cssText='display:block;max-width:280px;padding:8px;';
+  for(const [value,label] of [['','ダウンロード結果'],['started','다운로드 시작 확인'],['completed','다운로드 완료 확인'],['failed','다운로드 실패 확인']]){const option=document.createElement('option');option.value=value;option.textContent=label==='ダウンロード結果'?'다운로드 결과 선택':label;resultChoice.appendChild(option);}
+  box.append(status,resultChoice,button);document.documentElement.appendChild(box);
  },50);
 }
 
@@ -229,7 +288,9 @@ async function saveLog(text, type = 'INFO') {
   const now = new Date().toLocaleTimeString('ko-KR', { hour12: false });
   const data = await chrome.storage.local.get({ logs: [], accounts: [], currentIndex: 0 });
   const accId = data.accounts[data.currentIndex]?.id || 'System';
-  const entry = `[${now}] [${type}] (${accId}) ${text}`;
+  const verified=await GM.getValue('verifiedSession',null);const snapshot=sessionIdentity();
+  const actual=verified&&snapshot?.memberNo===verified.memberNo?verified.account:'미확인';
+  const entry = `[${now}] [${type}] [목표:${accId}] [실제:${actual}] ${text}`;
   const updatedLogs = [...(data.logs || []), entry];
 
   await chrome.storage.local.set({
@@ -434,28 +495,8 @@ async function createFloatingPanel() {
   const done = document.createElement('button');
   done.textContent = '파일 저장·재생 확인 → 다음 진행';
   done.style.cssText = 'display:block;margin-top:8px;padding:12px;width:100%;';
-  done.onclick = async () => {
-    done.disabled = true;
-    try {
-      const d = await chrome.storage.local.get(['isRunning','step','accounts','currentIndex','songs','songIndex']);
-      if (sessionStorage.getItem('genie-safari-controller') !== 'yes') { alert('자동화를 시작했던 원래 탭에서 확인해 주세요.'); return; }
-      if (!d.isRunning || !['SONG_DOWNLOAD','PAY_POPUP_STEP1','WAIT_DOWNLOAD_STREAM'].includes(d.step)) { alert('다운로드 대기 상태가 아닙니다.'); return; }
-      if (!confirm('현재 계정의 파일이 0KB가 아니고 실제로 재생되는 것을 확인했나요?')) return;
-      const account = d.accounts?.[d.currentIndex];
-      if (!account) return;
-      await updateStepResult(account.id,'down','o');
-      await saveLog('사용자가 파일 저장 및 재생 완료를 확인했습니다.','SUCCESS');
-      const nextSong = (d.songIndex || 0)+1;
-      if(nextSong < (d.songs || []).length) {
-        await chrome.storage.local.set({songIndex:nextSong,step:'SONG_LIKE',waitRetry:0});
-        location.href=getUrl('song',d.songs[nextSong]);
-      } else {
-        const next = (d.currentIndex || 0)+1;
-        await chrome.storage.local.set({currentIndex:next,albumIndex:0,songIndex:0,waitRetry:0,step:next>=d.accounts.length?'IDLE':'NEXT_ACCOUNT_LOGIN',isRunning:next<d.accounts.length});
-        location.href='https://www.genie.co.kr/member/logout?page_rfr='+encodeURIComponent('https://www.genie.co.kr/');
-      }
-    } catch(error) { genieShowError(error); } finally { done.disabled=false; }
-  };
+  done.textContent='다운로드 결과 기록 → 다음 진행';
+  done.onclick=async()=>{try{const choice=prompt('직접 확인한 결과 번호를 입력하세요: 1 시작 / 2 완료 / 3 실패');if(choice===null)return;await requestUserNext({'1':'started','2':'completed','3':'failed'}[choice]);}catch(error){alert(error.message);}};
   manual.appendChild(done);
   panel.insertBefore(manual,panel.children[1] || null);
 
@@ -532,7 +573,7 @@ async function createFloatingPanel() {
 
   document.getElementById('btn-resume').onclick = async () => {
     if(!remoteSettingsReady){alert('GitHub 공통 SID를 불러오지 못했습니다. 새로고침해 주세요.');return;}
-    await GM.setValue('safariControllerOwner',safariTabToken());
+    await GM.setValue('safariControllerOwner',safariTabToken());sessionStorage.setItem('genie-navigation-owner',safariTabToken());
     sessionStorage.setItem('genie-safari-controller', 'yes');
     // [중요] 1시간(3600000ms) 이내 인증 기록 확인
     const { lastAuthTime } = await chrome.storage.local.get(['lastAuthTime']);
@@ -764,41 +805,32 @@ function setInputValue(el, val) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-function performLikeWithCheck(onComplete) {
-  const countEl = document.querySelector('#emLikeCount');
-  const likeBtn =
-    (countEl && countEl.closest('a, button')) ||
-    document.querySelector('a.btn-like') ||
-    document.querySelector('a[onclick*="like"]');
-
-  if (likeBtn) {
-    const isAlreadyLiked =
-      likeBtn.classList.contains('on') ||
-      likeBtn.classList.contains('active') ||
-      (likeBtn.parentElement && likeBtn.parentElement.classList.contains('on'));
-
-    if (isAlreadyLiked) {
-      // 딜레이 0.3초 증가
-      setTimeout(() => onComplete(true, '이미 좋아요 상태(스킵)'), 700);
-    } else {
-      likeBtn.click();
-      // 딜레이 0.3초 증가
-      setTimeout(() => onComplete(true, '좋아요 클릭 성공'), 1200);
-    }
-  } else {
-    // 딜레이 0.3초 증가
-    setTimeout(() => onComplete(false, '좋아요 버튼 없음'), 700);
-  }
+async function performLikeWithCheck(onComplete){
+ const data=await chrome.storage.local.get(['accounts','currentIndex']);const expected=data.accounts?.[data.currentIndex]?.id;
+ if(!(await stillCurrent(expected)))return;
+ const count=document.querySelector('#emLikeCount');const button=(count&&count.closest('a, button'))||document.querySelector('a.btn-like');
+ if(!button){await onComplete(false,'좋아요 버튼 없음');return;}
+ const before=button.classList.contains('on')||button.classList.contains('active')||button.parentElement?.classList.contains('on');
+ if(!before)button.click();
+ await new Promise(resolve=>setTimeout(resolve,before?200:1200));
+ if(!(await stillCurrent(expected)))return;
+ const after=button.classList.contains('on')||button.classList.contains('active')||button.parentElement?.classList.contains('on');
+ await onComplete(!!after,before?'이미 좋아요 상태 확인':after?'좋아요 상태 변경 확인':'클릭 후 좋아요 상태 미확인');
 }
 
 let isStepRunning = false;
+async function processTask(){
+ if(window!==window.top||document.hidden)return;
+ if(!navigator.locks){genieShowError(new Error('이 Safari에서는 중복 방지 잠금을 사용할 수 없습니다. iOS 업데이트가 필요합니다.'));return;}
+ return navigator.locks.request('genie-account-worker',{ifAvailable:true},async lock=>{if(lock)await processTaskUnlocked();});
+}
 
 
 function safariIsPaymentContext(){
  return location.hostname==='pay.genie.co.kr' || /^\/(download|buy)\//i.test(location.pathname) || !!document.querySelector('#btnPaySong,#btnDownLoad,#name-genie');
 }
 
-async function processTask() {
+async function processTaskUnlocked() {
   if(!remoteSettingsReady)return;
   // Popup tabs inherit sessionStorage from their opener; they must never run
   // login/album routing. Their next-account button has its own handler.
@@ -838,6 +870,7 @@ async function processTask() {
     const currentAccount = accounts[currentIndex];
     const currentUrl = window.location.href;
 
+    if(['SONG_LIKE','SONG_DOWNLOAD','WAIT_DOWNLOAD_STREAM','PAY_POPUP_STEP1'].includes(step))sessionStorage.removeItem('genie-safari-login-pending');
     const pendingText=sessionStorage.getItem('genie-safari-login-pending');
     if(pendingText){
       let pending;try{pending=JSON.parse(pendingText);}catch(_){sessionStorage.removeItem('genie-safari-login-pending');}
@@ -881,9 +914,9 @@ async function processTask() {
         sessionStorage.removeItem('genie-login-submitted');
         sessionStorage.removeItem('genie-safari-login-pending');
         await saveLog(`❌ ${currentAccount.id} - 로그인 응답 오류 확인 후 다음 계정`, 'ERROR');
-        await updateStepResult(currentAccount.id, 'album', 'x');
-        await updateStepResult(currentAccount.id, 'song', 'x');
-        await updateStepResult(currentAccount.id, 'down', 'x');
+        await updateStepResult(currentAccount.id, 'album', '미실행');
+        await updateStepResult(currentAccount.id, 'song', '미실행');
+        await updateStepResult(currentAccount.id, 'down', '미실행');
         const nextStage = getNextStageUrl('ALBUM_LIKE', data);
         await chrome.storage.local.set({
           currentIndex: currentIndex + 1,
@@ -915,13 +948,15 @@ async function processTask() {
 
         sessionStorage.setItem('genie-safari-login-pending',JSON.stringify({account:currentAccount.id,page:location.origin+location.pathname}));
         // 딜레이 0.3초 증가 (600 -> 900)
-        setTimeout(() => {
+        setTimeout(async () => {
           const loginBtn =
             document.querySelector('input.btn-submit[value="로그인"]') ||
             document.querySelector('input.btn-submit') ||
             document.querySelector('input[type="submit"]') ||
             document.querySelector('button[type="submit"]') ||
             document.querySelector('.btn-login');
+          const live=await chrome.storage.local.get(['isRunning','accounts','currentIndex']);
+          if(!live.isRunning||live.accounts?.[live.currentIndex]?.id!==currentAccount.id||document.hidden||!(await safariOwnsController()))return;
           sessionStorage.setItem('genie-login-submitted',JSON.stringify({account:currentAccount.id,time:Date.now()}));
           if (loginBtn) loginBtn.click();
           else callPageFunction('loginID');
@@ -969,6 +1004,7 @@ async function processTask() {
       return;
     }
 
+    if(['ALBUM_LIKE','SONG_LIKE','SONG_DOWNLOAD','PAY_POPUP_STEP1','WAIT_DOWNLOAD_STREAM'].includes(step) && !(await verifyCurrentAccount(data)))return;
     // 앨범 좋아요 단계
     if (step === 'ALBUM_LIKE') {
       if (albums && albumIndex < albums.length) {
@@ -977,7 +1013,8 @@ async function processTask() {
           isStepRunning = false;
           return;
         }
-        performLikeWithCheck(async (ok, msg) => {
+        await performLikeWithCheck(async (ok, msg) => {
+          if(!(await stillCurrent(currentAccount.id)))return;
           await updateStepResult(currentAccount.id, 'album', ok ? 'o' : 'x');
           const nextIdx = albumIndex + 1;
           await saveLog(`💿 앨범(${albums[albumIndex]}) ${msg}`, ok ? 'SUCCESS' : 'ERROR');
