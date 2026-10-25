@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 지니 Safari 도우미 (수동 다운로드 확인)
 // @namespace genie-safari-local
-// @version 1.0.22
+// @version 1.0.25
 // @updateURL https://hse0722-debug.github.io/genie-safari/genie-safari.user.js
 // @downloadURL https://hse0722-debug.github.io/genie-safari/genie-safari.user.js
 // @match https://*.genie.co.kr/*
@@ -77,6 +77,16 @@ setInterval(async()=>{
 
 function sessionIdentity(){try{return JSON.parse(document.documentElement.getAttribute('data-genie-session')||'null');}catch(_){return null;}}
 
+
+function loginScreenState(){
+ const visible=el=>!!el&&el.getClientRects().length>0&&getComputedStyle(el).visibility!=='hidden';
+ const nodes=Array.from(document.querySelectorAll('button,a'));
+ const loggedIn=nodes.some(el=>visible(el)&&(/getMyProductInfo/.test(el.getAttribute('onclick')||'')||el.classList.contains('btn-logout')));
+ const loginLabel=nodes.some(el=>!el.closest('#genie-helper-dashboard')&&visible(el)&&/^로그인\s*(?:\/\s*회원가입)?$/.test((el.textContent||'').trim()));
+ const form=visibleLoginInputs();
+ return {loggedIn,loggedOut:!loggedIn&&(loginLabel||!!(form.id&&form.pw))};
+}
+
 function visibleLoginInputs(){
  const pick=selectors=>Array.from(document.querySelectorAll(selectors)).find(el=>el.getClientRects().length>0);
  return {id:pick('#gnb_uxd,#gnb_uxd_id,#uxd_id,input[name="gnb_uxd"]'),pw:pick('#gnb_uxx,#gnb_uxd_pw,#uxd_pw,input[name="gnb_uxx"]')};
@@ -84,17 +94,43 @@ function visibleLoginInputs(){
 async function beginConfirmedLogout(nextIndex){
  await GM.deleteValue('verifiedSession');await GM.deleteValue('loginSequence');
  sessionStorage.removeItem('genie-safari-login-pending');sessionStorage.removeItem('genie-login-submitted');
- await chrome.storage.local.set({step:'WAIT_LOGOUT',pendingAccountIndex:nextIndex,logoutRequestedAt:Date.now(),isRunning:true});
- await saveLog('로그아웃 요청 · 로그아웃 확인 전에는 다음 계정 로그인 금지','INFO');
- location.href='https://www.genie.co.kr/member/logout?page_rfr='+encodeURIComponent('https://www.genie.co.kr/');
+ await chrome.storage.local.set({step:'LOGOUT_HOME',pendingAccountIndex:nextIndex,logoutRequestedAt:Date.now(),isRunning:true});
+ await saveLog('지니 홈으로 이동 후 로그아웃 상태 확인','INFO');
+ if(location.hostname!=='www.genie.co.kr'||!['/','/index'].includes(location.pathname))location.href='https://www.genie.co.kr/';
 }
 async function stopLoginFlow(message){await chrome.storage.local.set({isRunning:false});await saveLog(message+' · 작업 중단','ERROR');}
+
+let lastLoginProbeAt=0;
+async function probeLoggedInHome(){
+ if(Date.now()-lastLoginProbeAt<2500)return null;
+ lastLoginProbeAt=Date.now();
+ const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
+ try{
+  const response=await window.fetch('https://www.genie.co.kr/?genie_login_probe='+Date.now(),{credentials:'include',cache:'no-store',signal:controller.signal});
+  if(!response.ok)return null;
+  const html=await response.text();
+  const matches=Array.from(html.matchAll(/(?:var\s+)?iMemUno\s*=\s*["'](\d+)["']/g));
+  const numbers=Array.from(new Set(matches.map(m=>m[1])));
+  return numbers.length===1?{memberNo:numbers[0]}:null;
+ }catch(_){return null;}finally{clearTimeout(timer);}
+}
+
 async function handleLoginSequence(data){
  const stage=data.step;
- if(!['WAIT_LOGOUT','LOGIN_FORM','WAIT_LOGIN','CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN'].includes(stage))return false;
+ if(!['LOGOUT_HOME','WAIT_LOGOUT','LOGIN_FORM','WAIT_LOGIN','CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN'].includes(stage))return false;
  if(stage==='CHECK_OR_LOGIN'||stage==='NEXT_ACCOUNT_LOGIN'){await beginConfirmedLogout(data.currentIndex||0);return true;}
- const snap=sessionIdentity();const fields=visibleLoginInputs();
- const loggedOut=!!snap&&!snap.memberNo&&!isUserLoggedIn()&&!!(fields.id&&fields.pw||Array.from(document.querySelectorAll('.gnb-my button')).some(el=>el.getClientRects().length&&/로그인\/회원가입/.test(el.textContent||'')));
+ let snap=sessionIdentity();const fields=visibleLoginInputs();
+ const loggedOut=loginScreenState().loggedOut;
+ if(stage==='LOGOUT_HOME'){
+  if(location.hostname!=='www.genie.co.kr'||!['/','/index'].includes(location.pathname)){location.href='https://www.genie.co.kr/';return true;}
+  if(loginScreenState().loggedOut){await chrome.storage.local.set({step:'WAIT_LOGOUT'});return true;}
+  if(snap?.memberNo||loginScreenState().loggedIn){
+   await chrome.storage.local.set({step:'WAIT_LOGOUT',logoutRequestedAt:Date.now()});
+   await saveLog('지니 홈에서 로그아웃 실행','INFO');
+   location.href='https://www.genie.co.kr/auth/signOut?rfr='+encodeURIComponent('https://www.genie.co.kr/');return true;
+  }
+  if(Date.now()-data.logoutRequestedAt>30000)await stopLoginFlow('홈 화면의 로그인 상태를 확인하지 못했습니다');return true;
+ }
  if(stage==='WAIT_LOGOUT'){
   if(!loggedOut){if(Date.now()-data.logoutRequestedAt>30000)await stopLoginFlow('로그아웃 상태를 확인하지 못했습니다');return true;}
   const next=data.pendingAccountIndex??data.currentIndex??0;
@@ -109,8 +145,8 @@ async function handleLoginSequence(data){
  const account=data.accounts[data.currentIndex];
  if(!sequence||sequence.index!==data.currentIndex||sequence.account!==account.id){await stopLoginFlow('계정 로그인 순서 정보가 일치하지 않습니다');return true;}
  if(stage==='LOGIN_FORM'){
-  if(!snap)return true;
-  if(snap.memberNo){await stopLoginFlow('새 로그인 제출 전에 로그인 세션이 나타났습니다');return true;}
+  if(!snap&&(!fields.id||!fields.pw))return true;
+  if(snap?.memberNo&&!loginScreenState().loggedOut){await stopLoginFlow('새 로그인 제출 전에 로그인 세션이 나타났습니다');return true;}
   if(!fields.id||!fields.pw)return true;
   setInputValue(fields.id,account.id);setInputValue(fields.pw,account.pw);
   await GM.setValue('loginSequence',{...sequence,submitted:true,submittedAt:Date.now()});
@@ -122,6 +158,9 @@ async function handleLoginSequence(data){
  if(stage==='WAIT_LOGIN'){
   if(!sequence.submitted){await stopLoginFlow('로그인 제출 기록이 없습니다');return true;}
   if(Date.now()-sequence.submittedAt>1500&&genieLoginPageError()){await stopLoginFlow('지니 로그인 응답에 오류 안내가 있습니다');return true;}
+  if(!snap?.memberNo&&!(fields.id&&fields.pw)&&Date.now()-sequence.submittedAt>1000){
+   const probed=await probeLoggedInHome();if(probed)snap=probed;
+  }
   if(snap?.memberNo&&!(fields.id&&fields.pw)){
    await GM.setValue('verifiedSession',{account:account.id,index:data.currentIndex,memberNo:snap.memberNo,method:'confirmed-logout-then-login',nonce:sequence.nonce});
    await chrome.storage.local.set({step:'ALBUM_LIKE',albumIndex:0,songIndex:0,waitRetry:0});
@@ -163,9 +202,9 @@ async function recordUserDownload(request,data){
  const perAccount=outcomes[account]||{};perAccount[data.songs[request.song]]=request.outcome;outcomes[account]=perAccount;
  await GM.setValue('userDownloadOutcomes',outcomes);
  const values=data.songs.map(id=>perAccount[id]);
- const result=values.includes('failed')?'x':values.every(x=>x==='completed')?'o':values.includes(undefined)?'-':'시작확인';
+ const result=values.includes('failed')?'x':values.every(x=>x==='completed')?'o':values.includes(undefined)?'-':'다음진행';
  await updateStepResult(account,'down',result);
- await saveLog('사용자 다운로드 결과: '+({started:'시작 확인 (완료 미확인)',completed:'완료 확인',failed:'실패 확인'}[request.outcome])+' · 곡 '+data.songs[request.song],'INFO');
+ await saveLog('사용자 다운로드 결과: '+({started:'다음 계정 진행 버튼 확인 (다운로드 완료 미검증)',completed:'완료 확인',failed:'실패 확인'}[request.outcome])+' · 곡 '+data.songs[request.song],'INFO');
 }
 
 const documentControllerId=Date.now()+':'+Math.random();
@@ -226,21 +265,18 @@ if((genieDownloadPage || (location.hostname === 'pay.genie.co.kr' && !/시크릿
   box.style.cssText='position:fixed;bottom:calc(16px + env(safe-area-inset-bottom));right:12px;z-index:2147483647;background:#fff4d5;color:#111;padding:12px;border:2px solid #2980b9;border-radius:8px;max-width:300px;font:14px sans-serif;';
   const status=document.createElement('div');
   status.textContent='';
-  const button=document.createElement('button');button.textContent='다음 계정 진행';button.style.cssText='margin-top:8px;padding:10px;';
+  const button=document.createElement('button');button.textContent='3초 후 다음 계정 진행';button.style.cssText='margin-top:8px;padding:10px;';
   button.onclick=async()=>{
    button.disabled=true;
    try{
     const d=await chrome.storage.local.get(['isRunning','step','currentIndex','songIndex']);
     if(!d.isRunning||!['SONG_DOWNLOAD','PAY_POPUP_STEP1','WAIT_DOWNLOAD_STREAM'].includes(d.step)) {status.textContent='원래 탭이 다운로드 대기 상태가 아닙니다.';button.disabled=false;return;}
-    await requestUserNext(resultChoice.value);
+    await requestUserNext('started');
     let left=3;status.textContent='3초 후 다음 진행';
     const timer=setInterval(()=>{left--;status.textContent=left>0?left+'초 후 다음 진행':'다음 단계로 이동 중…';if(left<=0){clearInterval(timer);consumeDownloadApproval();try{window.opener?.postMessage('GENIE_APPROVAL_READY','https://www.genie.co.kr');window.opener?.focus();}catch(_){}}},1000);
    }catch(error){status.textContent='오류: '+error.message;button.disabled=false;}
   };
-  const resultChoice=document.createElement('select');
-  resultChoice.style.cssText='display:block;max-width:280px;padding:8px;';
-  for(const [value,label] of [['','ダウンロード結果'],['started','다운로드 시작 확인'],['completed','다운로드 완료 확인'],['failed','다운로드 실패 확인']]){const option=document.createElement('option');option.value=value;option.textContent=label==='ダウンロード結果'?'다운로드 결과 선택':label;resultChoice.appendChild(option);}
-  box.append(status,resultChoice,button);document.documentElement.appendChild(box);
+  box.append(status,button);document.documentElement.appendChild(box);
  },50);
 }
 
@@ -347,46 +383,6 @@ function isUserLoggedIn() {
 // =========================================================
 // 구글시트 원격 비밀번호 검증 함수 (추가된 핵심 로직)
 // =========================================================
-async function verifyRemotePassword() {
-  const SPREADSHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQbPI2-Jl21I-hHrIaPTaYIldo3-tJ-4Ml6aTiVZyc8q4az_ETGcOt2iY-E6suHUwbSbsIqXwtq3GGT/pub?output=csv";
-  
-  const passwordInput = document.getElementById('input-auth-pw');
-  const inputPw = passwordInput ? passwordInput.value.trim() : "";
-
-  if (!inputPw) {
-    await saveLog("⚠️ 원격 인증 비밀번호를 입력해주세요.", "ERROR");
-    alert("인증 비밀번호를 입력해주세요.");
-    return false;
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    const response = await fetch(SPREADSHEET_CSV_URL, { signal: controller.signal });
-    clearTimeout(timeoutId);
-
-    if (!response.ok) throw new Error("서버 응답이 올바르지 않습니다.");
-
-    const csvText = await response.text();
-    // 시트의 첫 번째 행, 첫 번째 열 값을 읽어옴
-    const serverPw = csvText.split(/\r?\n/)[0].split(',')[0].replace(/["']/g, "").trim();
-
-    if (inputPw === serverPw) {
-      await saveLog("✅ 원격 비밀번호 인증 성공!", "SUCCESS");
-      return true;
-    } else {
-      await saveLog("❌ 인증 비밀번호가 일치하지 않습니다.", "ERROR");
-      alert("비밀번호가 올바르지 않습니다. 관리자에게 문의하세요.");
-      return false;
-    }
-  } catch (err) {
-    await saveLog(`❌ 원격 인증 서버 연결 실패: ${err.message}`, "ERROR");
-    alert("인증 서버에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.");
-    return false;
-  }
-}
-
 // =========================================================
 // 1. 플로팅 리모컨 대시보드 UI (결제/다운로드 팝업창 제외 처리)
 // =========================================================
@@ -461,14 +457,6 @@ async function createFloatingPanel() {
         </div>
       </div>
 
-      <!-- 원격 인증 비밀번호 입력 영역 (추가됨) -->
-      <div style="margin-bottom:10px; border:1px solid #f39c12; border-radius:6px; padding:8px; background:#fef9e7;">
-        <div style="font-size:11px; font-weight:bold; color:#d35400; margin-bottom:4px;">🔐 원격 인증 비밀번호(한 시간에 한 번)</div>
-        <div style="display:flex; gap:4px; align-items:center;">
-          <input type="password" id="input-auth-pw" placeholder="인증 비밀번호 입력" style="flex:1; padding:5px; border:1px solid #ccc; border-radius:4px; font-size:11px;">
-        </div>
-      </div>
-
       <!-- 계정 파일 버튼 및 SID 직접 입력 영역 -->
       <div style="margin-bottom:10px; border:1px solid #ddd; border-radius:6px; padding:8px; background:#fafafa;">
         <div style="display:flex; gap:4px; margin-bottom:6px;">
@@ -476,11 +464,10 @@ async function createFloatingPanel() {
           <input type="file" id="file-acc" accept=".txt" style="display:none;">
           <button id="btn-reset-all" style="padding:6px 8px; background:#95a5a6; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">초기화</button>
         </div>
-        <!-- SID 직접 입력란 -->
+        <div style="font-size:11px;color:#555;margin-bottom:4px;">GitHub 공통 SID · 표시 전용</div>
         <div style="display:flex; gap:4px; align-items:center;">
-          <input type="text" id="input-quick-alb" placeholder="앨범 SID (또는 URL)" style="flex:1; padding:5px; border:1px solid #ccc; border-radius:4px; font-size:11px;">
-          <input type="text" id="input-quick-son" placeholder="음원 SID (또는 URL)" style="flex:1; padding:5px; border:1px solid #ccc; border-radius:4px; font-size:11px;">
-          <button id="btn-apply-sid" style="padding:5px 8px; background:#27ae60; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">SID 적용</button>
+          <input type="text" id="input-quick-alb" readonly aria-label="GitHub 공통 앨범 SID" placeholder="앨범 SID (또는 URL)" style="flex:1; padding:5px; border:1px solid #ccc; border-radius:4px; font-size:11px;">
+          <input type="text" id="input-quick-son" readonly aria-label="GitHub 공통 곡 SID" placeholder="음원 SID (또는 URL)" style="flex:1; padding:5px; border:1px solid #ccc; border-radius:4px; font-size:11px;">
         </div>
       </div>
 
@@ -517,16 +504,6 @@ async function createFloatingPanel() {
   `;
   document.body.appendChild(panel);
   const close=document.createElement('button'); close.textContent='닫기 ✕'; close.style.cssText='position:sticky;top:0;z-index:30;padding:12px;background:white;color:black;'; close.onclick=()=>panel.style.display='none'; panel.prepend(close);
-  const manual = document.createElement('div');
-  manual.style.cssText = 'padding:12px;background:#fff4d5;font-size:14px;';
-  manual.textContent = 'Safari판: 결제와 다운로드는 직접 진행하세요. 데스크탑 화면 요청이 필요할 수 있습니다. 0KB는 완료가 아닙니다. '; 
-  const done = document.createElement('button');
-  done.textContent = '파일 저장·재생 확인 → 다음 진행';
-  done.style.cssText = 'display:block;margin-top:8px;padding:12px;width:100%;';
-  done.textContent='다운로드 결과 기록 → 다음 진행';
-  done.onclick=async()=>{try{const choice=prompt('직접 확인한 결과 번호를 입력하세요: 1 시작 / 2 완료 / 3 실패');if(choice===null)return;await requestUserNext({'1':'started','2':'completed','3':'failed'}[choice]);}catch(error){alert(error.message);}};
-  manual.appendChild(done);
-  panel.insertBefore(manual,panel.children[1] || null);
 
   const header = document.getElementById('dash-header');
   let isDragging = false, offsetX = 0, offsetY = 0;
@@ -583,38 +560,11 @@ async function createFloatingPanel() {
     e.target.value = '';
   };
 
-  document.getElementById('btn-apply-sid').onclick = async () => {
-    const albVal = extractId(document.getElementById('input-quick-alb').value, 'axnm');
-    const sonVal = extractId(document.getElementById('input-quick-son').value, 'xgnm');
-    const updates = {};
-    if (albVal) updates.albums = [albVal];
-    if (sonVal) updates.songs = [sonVal];
-
-    if (Object.keys(updates).length === 0) {
-      await saveLog('⚠️ 적용할 앨범 또는 음원 SID를 입력해주세요.', 'ERROR');
-      return;
-    }
-    await chrome.storage.local.set(updates);
-    await saveLog(`✅ SID 직접 적용 완료 (앨범: ${albVal || '유지'}, 곡: ${sonVal || '유지'})`, 'SUCCESS');
-    updateDashboardUI();
-  };
-
   document.getElementById('btn-resume').onclick = async () => {
     if(!remoteSettingsReady){alert('GitHub 공통 SID를 불러오지 못했습니다. 새로고침해 주세요.');return;}
     await GM.setValue('safariControllerOwner',safariTabToken());sessionStorage.setItem('genie-navigation-owner',safariTabToken());
     sessionStorage.setItem('genie-safari-controller', 'yes');
-    // [중요] 1시간(3600000ms) 이내 인증 기록 확인
-    const { lastAuthTime } = await chrome.storage.local.get(['lastAuthTime']);
-    const now = Date.now();
-    
-    if (!lastAuthTime || (now - lastAuthTime) > 3600000) {
-      const isAuthorized = await verifyRemotePassword();
-      if (!isAuthorized) return; // 인증 실패 시 작동 중단
-      await chrome.storage.local.set({ lastAuthTime: now }); // 성공 시간 저장
-    } else {
-      await saveLog("✅ 원격 비밀번호 인증 자동 통과 (1시간 이내)", "SUCCESS");
-    }
-
+    try{await applySharedSidConfig();}catch(error){await chrome.storage.local.set({isRunning:false});genieShowError(error);return;}
     const data = await chrome.storage.local.get(['accounts', 'step', 'currentIndex', 'albumIndex', 'songIndex', 'albums', 'songs']);
     if (!data.accounts || data.accounts.length === 0) {
       await saveLog('⚠️ 계정 파일을 먼저 등록해주세요!', 'ERROR');
