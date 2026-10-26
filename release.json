@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "version": "1.0.28",
+  "version": "1.0.29",
   "main": {
-    "file": "genie-main-1.0.28.js",
-    "sha256": "fc630bcd63d93a0a16374cbd55989dd12fc7c4fecd18f5c8a0a48e104dd92cfe"
+    "file": "genie-main-1.0.29.js",
+    "sha256": "bcd2cc7fe4cf431575eb42bb6cc8e80d86f8f81edcfae1c55280fa5df8001da5"
   },
   "bridge": {
     "file": "genie-bridge-1.0.21.js",
